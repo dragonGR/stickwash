@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_name="Stickwash"
+
+selected_format_profile=""
+selected_label=""
+
+say() {
+  printf '%s\n' "$*"
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run this script as root. It needs real access to block devices."
+}
+
+have_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+need_tools() {
+  local missing=()
+  local tool
+
+  for tool in lsblk findmnt umount wipefs parted partprobe udevadm; do
+    have_command "$tool" || missing+=("$tool")
+  done
+
+  ((${#missing[@]} == 0)) || die "Missing tools: ${missing[*]}"
+
+  if ! have_command mkfs.ext4 && ! have_command mkfs.exfat && ! have_command mkfs.fat && ! have_command mkfs.vfat; then
+    die "Missing filesystem tools. Install e2fsprogs, exfatprogs, or dosfstools."
+  fi
+}
+
+field() {
+  local key=$1
+  local line=$2
+  local pattern
+
+  pattern="${key}=\"([^\"]*)\""
+
+  if [[ $line =~ $pattern ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  return 1
+}
+
+discover_drives() {
+  local line path rm tran size model serial kind
+
+  while IFS= read -r line; do
+    path=$(field PATH "$line") || continue
+    rm=$(field RM "$line") || rm="0"
+    tran=$(field TRAN "$line") || tran=""
+    size=$(field SIZE "$line") || size="?"
+    model=$(field MODEL "$line") || model=""
+    serial=$(field SERIAL "$line") || serial=""
+    kind=$(field TYPE "$line") || kind=""
+
+    [[ $kind == "disk" ]] || continue
+    [[ $rm == "1" || $tran == "usb" ]] || continue
+
+    printf '%s|%s|%s|%s\n' "$path" "$size" "$model" "$serial"
+  done < <(lsblk -dnP -o PATH,RM,TRAN,SIZE,MODEL,SERIAL,TYPE)
+}
+
+drive_title() {
+  local entry=$1
+  local path size model serial
+
+  IFS='|' read -r path size model serial <<<"$entry"
+
+  printf '%s  %s' "$path" "$size"
+
+  if [[ -n $model ]]; then
+    printf '  %s' "$model"
+  fi
+
+  if [[ -n $serial ]]; then
+    printf '  [%s]' "$serial"
+  fi
+
+  printf '\n'
+}
+
+layout_snapshot() {
+  local device=$1
+
+  lsblk -o PATH,SIZE,FSTYPE,LABEL,MOUNTPOINTS "$device"
+}
+
+show_layout() {
+  local device=$1
+
+  printf '\n'
+  layout_snapshot "$device"
+  printf '\n'
+}
+
+format_profiles() {
+  if have_command mkfs.ext4; then
+    printf '%s\n' "ext4|Linux default|mkfs.ext4|16|yes|e2fsprogs"
+  else
+    printf '%s\n' "ext4|Linux default|mkfs.ext4|16|no|e2fsprogs"
+  fi
+
+  if have_command mkfs.exfat; then
+    printf '%s\n' "exFAT|Windows and Linux|mkfs.exfat|15|yes|exfatprogs"
+  else
+    printf '%s\n' "exFAT|Windows and Linux|mkfs.exfat|15|no|exfatprogs"
+  fi
+
+  if have_command mkfs.fat; then
+    printf '%s\n' "FAT32|Older but widely supported|mkfs.fat|11|yes|dosfstools"
+  elif have_command mkfs.vfat; then
+    printf '%s\n' "FAT32|Older but widely supported|mkfs.vfat|11|yes|dosfstools"
+  else
+    printf '%s\n' "FAT32|Older but widely supported|mkfs.fat|11|no|dosfstools"
+  fi
+}
+
+prompt_format_profile() {
+  local choice index
+  local profiles=()
+  local name note tool limit available package
+
+  mapfile -t profiles < <(format_profiles)
+
+  while true; do
+    say ""
+    say "Pick a filesystem:"
+
+    for index in "${!profiles[@]}"; do
+      IFS='|' read -r name note tool limit available package <<<"${profiles[index]}"
+
+      if [[ $available == "yes" ]]; then
+        say "  $((index + 1)). $name  $note"
+      else
+        say "  $((index + 1)). $name  unavailable here, install $package"
+      fi
+    done
+
+    say "  q. back"
+    read -r -p "Filesystem: " choice
+
+    case "$choice" in
+      q|Q|'')
+        return 1
+        ;;
+    esac
+
+    [[ $choice =~ ^[0-9]+$ ]] || {
+      say "Pick a number or q."
+      continue
+    }
+
+    if ((choice < 1 || choice > ${#profiles[@]})); then
+      say "That filesystem number is out of range."
+      continue
+    fi
+
+    IFS='|' read -r name note tool limit available package <<<"${profiles[choice - 1]}"
+
+    if [[ $available == "yes" ]]; then
+      selected_format_profile="${profiles[choice - 1]}"
+      return 0
+    fi
+
+    say ""
+    say "$name is not available on this machine yet."
+    say "Install $package, then run Stickwash again."
+  done
+}
+
+prompt_label() {
+  local filesystem_name=$1
+  local limit=$2
+  local label
+
+  while true; do
+    read -r -p "$filesystem_name label, blank is fine: " label
+
+    if ((${#label} <= limit)); then
+      selected_label=$label
+      return 0
+    fi
+
+    say "Keep the $filesystem_name label at $limit characters or less."
+  done
+}
+
+format_partition() {
+  local tool=$1
+  local label=$2
+  local part=$3
+
+  case "$tool" in
+    mkfs.ext4)
+      if [[ -n $label ]]; then
+        mkfs.ext4 -F -q -L "$label" "$part"
+      else
+        mkfs.ext4 -F -q "$part"
+      fi
+      ;;
+    mkfs.exfat)
+      if [[ -n $label ]]; then
+        mkfs.exfat -q -L "$label" "$part"
+      else
+        mkfs.exfat -q "$part"
+      fi
+      ;;
+    mkfs.fat|mkfs.vfat)
+      if [[ -n $label ]]; then
+        "$tool" -F 32 -n "$label" "$part" >/dev/null
+      else
+        "$tool" -F 32 "$part" >/dev/null
+      fi
+      ;;
+    *)
+      die "Unknown formatter: $tool"
+      ;;
+  esac
+}
+
+confirm_wipe() {
+  local device=$1
+
+  say ""
+  say "This will erase every partition and filesystem signature on $device."
+  say "There is no undo."
+  show_layout "$device"
+
+  read -r -p "Type the device path to continue: " typed
+  [[ $typed == "$device" ]]
+}
+
+after_format_prompt() {
+  local choice
+
+  while true; do
+    read -r -p "Press Enter to start over, or q to quit: " choice
+
+    case "$choice" in
+      '')
+        return 0
+        ;;
+      q|Q)
+        exit 0
+        ;;
+      *)
+        say "Press Enter to start over, or q to quit."
+        ;;
+    esac
+  done
+}
+
+unmount_children() {
+  local device=$1
+  local node
+  local nodes=()
+
+  mapfile -t nodes < <(lsblk -ln -o PATH "$device")
+
+  for node in "${nodes[@]:1}"; do
+    if findmnt -rn -S "$node" >/dev/null 2>&1; then
+      say "Unmounting $node"
+      umount "$node"
+    fi
+  done
+}
+
+first_partition() {
+  local device=$1
+  local nodes=()
+  local attempt
+
+  for attempt in {1..10}; do
+    mapfile -t nodes < <(lsblk -ln -o PATH "$device")
+
+    if ((${#nodes[@]} > 1)); then
+      printf '%s\n' "${nodes[1]}"
+      return 0
+    fi
+
+    partprobe "$device" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+    sleep 1
+  done
+
+  return 1
+}
+
+wipe_and_make_filesystem() {
+  local device=$1
+  local filesystem_name=$2
+  local formatter=$3
+  local label=$4
+  local root_source part node before_layout after_layout
+  local nodes=()
+
+  root_source=$(findmnt -no SOURCE / 2>/dev/null || true)
+  if [[ -n $root_source && $root_source == "$device"* ]]; then
+    die "Refusing to touch the drive that backs /."
+  fi
+
+  before_layout=$(layout_snapshot "$device")
+
+  confirm_wipe "$device" || {
+    say "Cancelled."
+    return 0
+  }
+
+  unmount_children "$device"
+
+  mapfile -t nodes < <(lsblk -ln -o PATH "$device")
+  for node in "${nodes[@]:1}"; do
+    wipefs -af "$node" >/dev/null 2>&1 || true
+  done
+
+  wipefs -af "$device" >/dev/null
+  parted -s "$device" mklabel gpt
+  parted -s "$device" mkpart primary 1MiB 100%
+  partprobe "$device"
+  udevadm settle
+
+  part=$(first_partition "$device") || die "The new partition did not show up."
+  format_partition "$formatter" "$label" "$part"
+
+  partprobe "$device" >/dev/null 2>&1 || true
+  udevadm settle >/dev/null 2>&1 || true
+
+  after_layout=$(layout_snapshot "$device")
+
+  say ""
+  say "$device has been formatted as $filesystem_name."
+  say "Before, it looked like this:"
+  printf '%s\n' "$before_layout"
+  say ""
+  say "Now it looks like this:"
+  printf '%s\n' "$after_layout"
+  say ""
+  say "If you want to wipe another drive, start over from the drive list."
+  after_format_prompt
+}
+
+drive_menu() {
+  local entry=$1
+  local device choice
+  local filesystem_name note formatter label_limit available package
+
+  IFS='|' read -r device _ <<<"$entry"
+
+  while true; do
+    say ""
+    say "Picked: $(drive_title "$entry")"
+    say "  1. Show current layout"
+    say "  2. Wipe it and format it"
+    say "  3. Back to the drive list"
+
+    read -r -p "What now: " choice
+
+    case "$choice" in
+      1)
+        show_layout "$device"
+        ;;
+      2)
+        prompt_format_profile || continue
+        IFS='|' read -r filesystem_name note formatter label_limit available package <<<"$selected_format_profile"
+        prompt_label "$filesystem_name" "$label_limit"
+        wipe_and_make_filesystem "$device" "$filesystem_name" "$formatter" "$selected_label"
+        return 0
+        ;;
+      3)
+        return 0
+        ;;
+      *)
+        say "Pick 1, 2, or 3."
+        ;;
+    esac
+  done
+}
+
+main() {
+  local choice index
+  local drives=()
+
+  need_root
+  need_tools
+
+  say "$project_name"
+  say ""
+  say "This script only lists removable USB drives."
+  say ""
+
+  while true; do
+    mapfile -t drives < <(discover_drives)
+
+    if ((${#drives[@]} == 0)); then
+      read -r -p "No removable USB drives found. Press Enter to scan again, or q to quit: " choice
+      [[ $choice == "q" || $choice == "Q" ]] && exit 0
+      continue
+    fi
+
+    say "Drives on this machine:"
+    for index in "${!drives[@]}"; do
+      say "  $((index + 1)). $(drive_title "${drives[index]}")"
+    done
+    say "  r. scan again"
+    say "  q. quit"
+
+    read -r -p "Pick a drive: " choice
+
+    case "$choice" in
+      q|Q)
+        exit 0
+        ;;
+      r|R|'')
+        continue
+        ;;
+    esac
+
+    [[ $choice =~ ^[0-9]+$ ]] || {
+      say "Pick a number, r, or q."
+      continue
+    }
+
+    if ((choice < 1 || choice > ${#drives[@]})); then
+      say "That drive number is out of range."
+      continue
+    fi
+
+    drive_menu "${drives[choice - 1]}"
+  done
+}
+
+main "$@"

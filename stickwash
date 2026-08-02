@@ -382,13 +382,27 @@ prompt_partition_for_relabel() {
 
 confirm_wipe() {
   local device=$1
+  local mounted=()
+  local mountpoint
 
   say ""
-  say "This will erase every partition and filesystem signature on $device."
-  say "There is no undo."
+  say "This will permanently erase everything on $device."
+  say ""
+
+  # Check for mounted partitions
+  while IFS= read -r mountpoint; do
+    [[ -n $mountpoint ]] && mounted+=("$mountpoint")
+  done < <(lsblk -ln -o MOUNTPOINTS "$device" | grep -v '^$')
+
+  if ((${#mounted[@]} > 0)); then
+    say ""
+    say "These will be unmounted and destroyed:"
+    printf '  • %s\n' "${mounted[@]}"
+  fi
+
   show_layout "$device"
 
-  read -r -p "Type the device path to continue: " typed
+  read -r -p "Type the FULL device path ($device) to confirm: " typed
   [[ $typed == "$device" ]]
 }
 

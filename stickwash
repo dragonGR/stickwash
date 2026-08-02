@@ -430,8 +430,11 @@ unmount_partition_if_needed() {
   local part=$1
 
   if findmnt -rn -S "$part" >/dev/null 2>&1; then
-    say "Unmounting $part"
-    umount "$part"
+    say "Unmounting $part..."
+    if ! umount "$part" 2>/dev/null; then
+      say "$part is busy. Attempting lazy unmount..."
+      umount -l "$part" || die "Cannot unmount $part. Close any programs using it and try again."
+    fi
   fi
 }
 

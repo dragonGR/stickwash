@@ -245,6 +245,10 @@ format_partition() {
       die "Unknown formatter: $tool"
       ;;
   esac
+
+  # Ensure data is written to device before proceeding
+  sync "$part" || say_warn "Warning: sync reported an issue (non-fatal)"
+  say_ok "Format complete."
 }
 
 discover_partitions() {

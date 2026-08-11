@@ -1,0 +1,1 @@
+"""Stickwash test suite."""

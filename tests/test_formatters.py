@@ -44,6 +44,33 @@ class TestFormatters(unittest.TestCase):
         with self.assertRaises(ValueError):
             relabel_partition("ntfs", "/dev/sdc1", "TESTLABEL")
 
+    def test_format_fat32_and_exfat_native(self) -> None:
+        import os
+        import tempfile
+        from stickwash_lib.formatters import format_exfat_native, format_fat32_native, get_device_size_bytes
+
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+            tf.seek(64 * 1024 * 1024 - 1)
+            tf.write(b"\0")
+            img_path = tf.name
+
+        try:
+            self.assertEqual(get_device_size_bytes(img_path), 64 * 1024 * 1024)
+
+            format_fat32_native(img_path, label="TESTFAT")
+            with open(img_path, "rb") as f:
+                header = f.read(512)
+                self.assertIn(b"FAT32", header)
+                self.assertIn(b"TESTFAT", header)
+
+            format_exfat_native(img_path, label="TESTEXFAT")
+            with open(img_path, "rb") as f:
+                header = f.read(512)
+                self.assertIn(b"EXFAT", header)
+        finally:
+            if os.path.exists(img_path):
+                os.remove(img_path)
+
 
 if __name__ == "__main__":
     unittest.main()

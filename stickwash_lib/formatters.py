@@ -208,8 +208,33 @@ def resolve_created_partition(device_path: str, dry_run: bool = False) -> str:
     raise RuntimeError(f"New partition ({expected_part}) did not appear on {device_path} after formatting partition table.")
 
 
+def get_device_size_bytes(device_path: str) -> int:
+    try:
+        import fcntl
+
+        BLKGETSIZE64 = 0x80081272
+        with open(device_path, "rb") as f:
+            buf = fcntl.ioctl(f.fileno(), BLKGETSIZE64, b"\x00" * 8)
+            size = struct.unpack("<Q", buf)[0]
+            if size > 0:
+                return size
+    except Exception:
+        pass
+
+    try:
+        with open(device_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size > 0:
+                return size
+    except Exception:
+        pass
+
+    return os.path.getsize(device_path)
+
+
 def format_fat32_native(device_path: str, label: str = "") -> None:
-    file_size = os.path.getsize(device_path)
+    file_size = get_device_size_bytes(device_path)
     total_sectors = file_size // 512
     if total_sectors < 65536:
         sectors_per_cluster = 1
@@ -226,6 +251,9 @@ def format_fat32_native(device_path: str, label: str = "") -> None:
     fat_size_sectors = ((tmp_clusters * 4) + 511) // 512
     total_clusters = (total_sectors - reserved_sectors - (num_fats * fat_size_sectors)) // sectors_per_cluster
     fat_size_sectors = (((total_clusters + 2) * 4) + 511) // 512
+
+    if total_clusters <= 0:
+        raise RuntimeError(f"Device {device_path} size ({file_size} B) is too small for FAT32.")
 
     clean_label = (label.strip().upper() or "NO NAME").ljust(11)[:11]
     vol_id = int(time.time()) & 0xFFFFFFFF
@@ -293,7 +321,7 @@ def format_fat32_native(device_path: str, label: str = "") -> None:
 
 
 def format_exfat_native(device_path: str, label: str = "") -> None:
-    file_size = os.path.getsize(device_path)
+    file_size = get_device_size_bytes(device_path)
     total_sectors = file_size // 512
 
     sector_bits = 9
@@ -310,6 +338,9 @@ def format_exfat_native(device_path: str, label: str = "") -> None:
         heap_offset += (spc - (heap_offset % spc))
 
     total_clusters = (total_sectors - heap_offset) // spc
+    if total_clusters <= 0:
+        raise RuntimeError(f"Device {device_path} size ({file_size} B) is too small for exFAT.")
+
     vol_id = int(time.time()) & 0xFFFFFFFF
     clean_label = label.strip() or "EXFATUSB"
     label_u16 = clean_label.encode("utf-16le")[:22]

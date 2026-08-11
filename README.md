@@ -8,38 +8,25 @@ It resolves common partitions and partition tables left behind by bootable ISO w
 
 ## Key Features
 
+- **Zero External Third-Party Python Dependencies:** Built entirely using Python 3 standard library modules (`struct`, `json`, `subprocess`, `fcntl`, `dataclasses`).
+- **Built-in Native FAT32 & exFAT Engines:** Formats and relabels `FAT32` and `exFAT` directly in pure Python without needing `dosfstools` (`mkfs.fat`) or `exfatprogs` (`mkfs.exfat`) installed.
 - **Automated USB Discovery:** Detects removable USB block devices with model, size, serial number, and partition layouts.
 - **Root & Mount Safeguards:** Refuses to format drives backing system mounts (`/`, `/boot`, `/home`, `/var`, `/usr`, `/etc`, or swap).
 - **Subcommands & Interactive TUI:** Run interactively without arguments, or use non-interactive CLI commands (`list`, `inspect`, `wipe`, `relabel`).
 - **Dry-Run Mode:** Simulate wiping or relabeling operations using `--dry-run` to inspect exact terminal commands before execution.
 - **JSON Output:** Export device and partition structures with `--json` for scripting and automation.
-- **Filesystem Support & Tool Detection:** Supports `ext4`, `exFAT`, and `FAT32` with automatic tool verification (`mkfs.ext4`, `mkfs.exfat`, `mkfs.fat`, `e2label`, `exfatlabel`, `fatlabel`) and package install hints.
 - **User Permission Handover:** Automatically mounts formatted volumes for the invoking `$SUDO_USER` under `/run/media/$SUDO_USER/<label>` or `/mnt/<label>`.
 
 ---
 
 ## Requirements
 
-### Core System Tools
+### Standard System Utilities
 - `python3` (>= 3.10)
 - `util-linux` (`lsblk`, `findmnt`, `wipefs`, `umount`, `mount`)
-- `parted`
-- `systemd` / `udev` (`partprobe`, `udevadm`)
+- `sfdisk` / `udev` (`sfdisk`, `partprobe`, `udevadm`)
 
-### Filesystem Formatter Packages
-- **ext4:** `e2fsprogs` (`mkfs.ext4`, `e2label`)
-- **exFAT:** `exfatprogs` (`mkfs.exfat`, `exfatlabel`)
-- **FAT32:** `dosfstools` (`mkfs.fat` / `mkfs.vfat`, `fatlabel`)
-
-On Arch Linux:
-```bash
-sudo pacman -S util-linux parted e2fsprogs exfatprogs dosfstools
-```
-
-On Ubuntu / Debian:
-```bash
-sudo apt update && sudo apt install util-linux parted e2fsprogs exfatprogs dosfstools
-```
+No external Python packages or filesystem tools (`dosfstools`, `exfatprogs`) are required. `ext4` formatting uses system `mkfs.ext4` (`e2fsprogs`), while `FAT32` and `exFAT` formatting engines are built directly into Stickwash.
 
 ---
 

@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import os
 import shutil
+import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -40,9 +39,8 @@ def get_package_installer(package_name: str) -> str:
 
 def get_filesystem_profiles() -> list[FilesystemProfile]:
     ext4_avail = have_tool("mkfs.ext4")
-    exfat_avail = have_tool("mkfs.exfat")
-    fat32_tool = "mkfs.fat" if have_tool("mkfs.fat") else ("mkfs.vfat" if have_tool("mkfs.vfat") else "")
-    fat32_avail = bool(fat32_tool)
+    fat32_tool = "mkfs.fat" if have_tool("mkfs.fat") else ("mkfs.vfat" if have_tool("mkfs.vfat") else "native")
+    exfat_tool = "mkfs.exfat" if have_tool("mkfs.exfat") else "native"
 
     return [
         FilesystemProfile(
@@ -57,20 +55,20 @@ def get_filesystem_profiles() -> list[FilesystemProfile]:
         FilesystemProfile(
             name="exfat",
             note="Optimal for cross-platform Linux and Windows compatibility",
-            mkfs_cmd="mkfs.exfat",
-            label_cmd="exfatlabel",
+            mkfs_cmd=exfat_tool,
+            label_cmd="exfatlabel" if have_tool("exfatlabel") else "native",
             label_limit=15,
             package="exfatprogs",
-            available=exfat_avail,
+            available=True,
         ),
         FilesystemProfile(
             name="fat32",
             note="Universal compatibility, maximum 4 GB per file",
-            mkfs_cmd=fat32_tool or "mkfs.fat",
-            label_cmd="fatlabel",
+            mkfs_cmd=fat32_tool,
+            label_cmd="fatlabel" if have_tool("fatlabel") else "native",
             label_limit=11,
             package="dosfstools",
-            available=fat32_avail,
+            available=True,
         ),
     ]
 
@@ -210,42 +208,305 @@ def resolve_created_partition(device_path: str, dry_run: bool = False) -> str:
     raise RuntimeError(f"New partition ({expected_part}) did not appear on {device_path} after formatting partition table.")
 
 
+def format_fat32_native(device_path: str, label: str = "") -> None:
+    file_size = os.path.getsize(device_path)
+    total_sectors = file_size // 512
+    if total_sectors < 65536:
+        sectors_per_cluster = 1
+    elif total_sectors < 16777216:
+        sectors_per_cluster = 8
+    else:
+        sectors_per_cluster = 32
+
+    reserved_sectors = 32
+    num_fats = 2
+    root_cluster = 2
+
+    tmp_clusters = (total_sectors - reserved_sectors) // sectors_per_cluster
+    fat_size_sectors = ((tmp_clusters * 4) + 511) // 512
+    total_clusters = (total_sectors - reserved_sectors - (num_fats * fat_size_sectors)) // sectors_per_cluster
+    fat_size_sectors = (((total_clusters + 2) * 4) + 511) // 512
+
+    clean_label = (label.strip().upper() or "NO NAME").ljust(11)[:11]
+    vol_id = int(time.time()) & 0xFFFFFFFF
+
+    boot = bytearray(512)
+    boot[0:3] = b"\xeb\x58\x90"
+    boot[3:11] = b"MSWIN4.1"
+    struct.pack_into("<H", boot, 0x0B, 512)
+    boot[0x0D] = sectors_per_cluster
+    struct.pack_into("<H", boot, 0x0E, reserved_sectors)
+    boot[0x10] = num_fats
+    boot[0x15] = 0xF8
+    struct.pack_into("<H", boot, 0x18, 63)
+    struct.pack_into("<H", boot, 0x1A, 255)
+    struct.pack_into("<I", boot, 0x1C, 2048)
+    struct.pack_into("<I", boot, 0x20, total_sectors)
+    struct.pack_into("<I", boot, 0x24, fat_size_sectors)
+    struct.pack_into("<I", boot, 0x2C, root_cluster)
+    struct.pack_into("<H", boot, 0x30, 1)
+    struct.pack_into("<H", boot, 0x32, 6)
+    boot[0x40] = 0x80
+    boot[0x42] = 0x29
+    struct.pack_into("<I", boot, 0x43, vol_id)
+    boot[0x47:0x52] = clean_label.encode("ascii")
+    boot[0x52:0x5A] = b"FAT32   "
+    boot[0x1FE:0x200] = b"\x55\xaa"
+
+    fsinfo = bytearray(512)
+    fsinfo[0:4] = b"\x52\x52\x61\x41"
+    fsinfo[0x1E4:0x1E8] = b"\x72\x72\x41\x61"
+    struct.pack_into("<I", fsinfo, 0x1E8, total_clusters - 1)
+    struct.pack_into("<I", fsinfo, 0x1EC, 3)
+    fsinfo[0x1FC:0x200] = b"\x00\x00\x55\xaa"
+
+    fat_sec0 = bytearray(512)
+    struct.pack_into("<I", fat_sec0, 0, 0x0FFFFFF8)
+    struct.pack_into("<I", fat_sec0, 4, 0xFFFFFFFF)
+    struct.pack_into("<I", fat_sec0, 8, 0x0FFFFFFF)
+
+    root_dir = bytearray(512 * sectors_per_cluster)
+    if clean_label != "NO NAME    ":
+        root_dir[0:11] = clean_label.encode("ascii")
+        root_dir[0x0B] = 0x08
+
+    with open(device_path, "r+b") as f:
+        f.seek(0)
+        f.write(boot)
+        f.seek(1 * 512)
+        f.write(fsinfo)
+        f.seek(6 * 512)
+        f.write(boot)
+
+        fat1_offset = reserved_sectors * 512
+        f.seek(fat1_offset)
+        f.write(fat_sec0)
+
+        fat2_offset = (reserved_sectors + fat_size_sectors) * 512
+        f.seek(fat2_offset)
+        f.write(fat_sec0)
+
+        cluster_heap_offset = (reserved_sectors + (num_fats * fat_size_sectors)) * 512
+        f.seek(cluster_heap_offset)
+        f.write(root_dir)
+        f.flush()
+
+
+def format_exfat_native(device_path: str, label: str = "") -> None:
+    file_size = os.path.getsize(device_path)
+    total_sectors = file_size // 512
+
+    sector_bits = 9
+    spc_bits = 6
+    spc = 1 << spc_bits
+    fat_offset = 24
+    num_fats = 1
+
+    total_clusters = (total_sectors - fat_offset) // spc
+    fat_size_sectors = (((total_clusters + 2) * 4) + 511) // 512
+
+    heap_offset = fat_offset + fat_size_sectors
+    if heap_offset % spc != 0:
+        heap_offset += (spc - (heap_offset % spc))
+
+    total_clusters = (total_sectors - heap_offset) // spc
+    vol_id = int(time.time()) & 0xFFFFFFFF
+    clean_label = label.strip() or "EXFATUSB"
+    label_u16 = clean_label.encode("utf-16le")[:22]
+
+    boot = bytearray(512)
+    boot[0:3] = b"\xeb\x76\x90"
+    boot[3:11] = b"EXFAT   "
+    struct.pack_into("<Q", boot, 64, 0)
+    struct.pack_into("<Q", boot, 72, total_sectors)
+    struct.pack_into("<I", boot, 80, fat_offset)
+    struct.pack_into("<I", boot, 84, fat_size_sectors)
+    struct.pack_into("<I", boot, 88, heap_offset)
+    struct.pack_into("<I", boot, 92, total_clusters)
+    struct.pack_into("<I", boot, 96, 4)
+    struct.pack_into("<I", boot, 100, vol_id)
+    struct.pack_into("<H", boot, 104, 0x0100)
+    struct.pack_into("<H", boot, 106, 0x0000)
+    boot[108] = sector_bits
+    boot[109] = spc_bits
+    boot[110] = num_fats
+    boot[111] = 0x80
+    boot[112] = 0
+    boot[510:512] = b"\x55\xaa"
+
+    boot_region = bytearray(11 * 512)
+    boot_region[0:512] = boot
+    for i in range(1, 11):
+        boot_region[i * 512 + 510:i * 512 + 512] = b"\x55\xaa"
+
+    chk = 0
+    for i, b in enumerate(boot_region):
+        if i in (106, 107, 112):
+            continue
+        chk = (((chk & 1) << 31) | (chk >> 1)) + b
+        chk &= 0xFFFFFFFF
+
+    checksum_sector = bytearray(512)
+    for i in range(0, 512, 4):
+        struct.pack_into("<I", checksum_sector, i, chk)
+
+    fat_sec0 = bytearray(512)
+    struct.pack_into("<I", fat_sec0, 0, 0xFFFFFFF8)
+    struct.pack_into("<I", fat_sec0, 4, 0xFFFFFFFF)
+    struct.pack_into("<I", fat_sec0, 8, 0xFFFFFFFF)
+    struct.pack_into("<I", fat_sec0, 12, 0xFFFFFFFF)
+    struct.pack_into("<I", fat_sec0, 16, 0xFFFFFFFF)
+
+    bitmap_size = (total_clusters + 7) // 8
+    bitmap_data = bytearray(spc * 512)
+    bitmap_data[0] = 0x07
+
+    upcase_data = bytearray(spc * 512)
+    for i in range(128):
+        struct.pack_into("<H", upcase_data, i * 2, ord(chr(i).upper()))
+    upcase_chk = 0
+    for b in upcase_data[:256]:
+        upcase_chk = (((upcase_chk & 1) << 31) | (upcase_chk >> 1)) + b
+        upcase_chk &= 0xFFFFFFFF
+
+    root_data = bytearray(spc * 512)
+    root_data[0] = 0x83
+    root_data[1] = len(label_u16) // 2
+    root_data[2:2 + len(label_u16)] = label_u16
+
+    root_data[32] = 0x81
+    root_data[33] = 0x00
+    struct.pack_into("<I", root_data, 32 + 20, 2)
+    struct.pack_into("<Q", root_data, 32 + 24, bitmap_size)
+
+    root_data[64] = 0x82
+    struct.pack_into("<I", root_data, 64 + 4, upcase_chk)
+    struct.pack_into("<I", root_data, 64 + 20, 3)
+    struct.pack_into("<Q", root_data, 64 + 24, 256)
+
+    with open(device_path, "r+b") as f:
+        f.seek(0)
+        f.write(boot_region)
+        f.write(checksum_sector)
+        f.seek(12 * 512)
+        f.write(boot_region)
+        f.write(checksum_sector)
+
+        f.seek(fat_offset * 512)
+        f.write(fat_sec0)
+
+        f.seek(heap_offset * 512)
+        f.write(bitmap_data)
+
+        f.seek((heap_offset + spc) * 512)
+        f.write(upcase_data)
+
+        f.seek((heap_offset + (2 * spc)) * 512)
+        f.write(root_data)
+        f.flush()
+
+
+def relabel_fat32_native(partition_path: str, new_label: str) -> None:
+    clean_label = (new_label.strip().upper() or "NO NAME").ljust(11)[:11]
+    with open(partition_path, "r+b") as f:
+        f.seek(0x47)
+        f.write(clean_label.encode("ascii"))
+        f.seek(6 * 512 + 0x47)
+        f.write(clean_label.encode("ascii"))
+        f.flush()
+
+
+def relabel_exfat_native(partition_path: str, new_label: str) -> None:
+    clean_label = new_label.strip() or "EXFATUSB"
+    label_u16 = clean_label.encode("utf-16le")[:22]
+
+    with open(partition_path, "r+b") as f:
+        f.seek(88)
+        heap_offset = struct.unpack("<I", f.read(4))[0]
+        f.seek(96)
+        root_cluster = struct.unpack("<I", f.read(4))[0]
+        f.seek(109)
+        spc_bits = f.read(1)[0]
+        spc = 1 << spc_bits
+
+        root_offset = (heap_offset + ((root_cluster - 2) * spc)) * 512
+        f.seek(root_offset)
+        root_data = bytearray(f.read(512))
+
+        if root_data[0] == 0x83:
+            root_data[1] = len(label_u16) // 2
+            root_data[2:2 + len(label_u16)] = label_u16.ljust(22, b"\x00")
+            f.seek(root_offset)
+            f.write(root_data[:32])
+            f.flush()
+
+
 def format_partition(
     fs_profile: FilesystemProfile,
     partition_path: str,
     label: str = "",
     dry_run: bool = False,
 ) -> None:
-    cmd = [fs_profile.mkfs_cmd]
-
     if fs_profile.name == "ext4":
-        cmd.extend(["-F", "-q"])
+        cmd = ["mkfs.ext4", "-F", "-q"]
         if label:
             cmd.extend(["-L", label])
         cmd.append(partition_path)
+
+        if dry_run:
+            say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
+            say(theme.muted(f"[DRY-RUN] Would run: sync {partition_path}"))
+            return
+
+        rc, _, err = exec_command(cmd, timeout=300.0)
+        if rc != 0:
+            raise RuntimeError(f"Formatting failed (mkfs.ext4): {err}")
     elif fs_profile.name == "exfat":
-        cmd.extend(["-q"])
-        if label:
-            cmd.extend(["-L", label])
-        cmd.append(partition_path)
+        if have_tool("mkfs.exfat"):
+            cmd = ["mkfs.exfat", "-q"]
+            if label:
+                cmd.extend(["-L", label])
+            cmd.append(partition_path)
+
+            if dry_run:
+                say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
+                say(theme.muted(f"[DRY-RUN] Would run: sync {partition_path}"))
+                return
+
+            rc, _, err = exec_command(cmd, timeout=300.0)
+            if rc != 0:
+                raise RuntimeError(f"Formatting failed (mkfs.exfat): {err}")
+        else:
+            if dry_run:
+                say(theme.muted(f"[DRY-RUN] Would run native Python exFAT formatter on {partition_path} (label: '{label}')"))
+                return
+            format_exfat_native(partition_path, label=label)
     elif fs_profile.name in ("fat32", "vfat"):
-        cmd.extend(["-F", "32"])
-        if label:
-            cmd.extend(["-n", label])
-        cmd.append(partition_path)
+        mkfs_bin = "mkfs.fat" if have_tool("mkfs.fat") else ("mkfs.vfat" if have_tool("mkfs.vfat") else "")
+        if mkfs_bin:
+            cmd = [mkfs_bin, "-F", "32"]
+            if label:
+                cmd.extend(["-n", label])
+            cmd.append(partition_path)
+
+            if dry_run:
+                say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
+                say(theme.muted(f"[DRY-RUN] Would run: sync {partition_path}"))
+                return
+
+            rc, _, err = exec_command(cmd, timeout=300.0)
+            if rc != 0:
+                raise RuntimeError(f"Formatting failed ({mkfs_bin}): {err}")
+        else:
+            if dry_run:
+                say(theme.muted(f"[DRY-RUN] Would run native Python FAT32 formatter on {partition_path} (label: '{label}')"))
+                return
+            format_fat32_native(partition_path, label=label)
     else:
         raise ValueError(f"Unsupported filesystem: {fs_profile.name}")
 
-    if dry_run:
-        say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
-        say(theme.muted(f"[DRY-RUN] Would run: sync {partition_path}"))
-        return
-
-    rc, _, err = exec_command(cmd, timeout=300.0)
-    if rc != 0:
-        raise RuntimeError(f"Formatting failed ({fs_profile.mkfs_cmd}): {err}")
-
-    exec_command(["sync", partition_path])
+    if not dry_run:
+        exec_command(["sync", partition_path])
 
 
 def relabel_partition(
@@ -255,30 +516,40 @@ def relabel_partition(
     dry_run: bool = False,
 ) -> None:
     norm_fs = fstype.lower()
-    tool = ""
     if norm_fs in ("ext2", "ext3", "ext4"):
-        tool = "e2label"
+        if not have_tool("e2label"):
+            raise RuntimeError(f"Relabel tool 'e2label' is missing. Install with: {get_package_installer('e2fsprogs')}")
+        cmd = ["e2label", partition_path, new_label]
+        if dry_run:
+            say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
+            return
+        unmount_partition(partition_path, dry_run=dry_run)
+        rc, _, err = exec_command(cmd)
+        if rc != 0:
+            raise RuntimeError(f"Relabeling failed (e2label): {err}")
     elif norm_fs == "exfat":
-        tool = "exfatlabel"
+        if dry_run:
+            say(theme.muted(f"[DRY-RUN] Would relabel exFAT partition {partition_path} to '{new_label}'"))
+            return
+        unmount_partition(partition_path, dry_run=dry_run)
+        if have_tool("exfatlabel"):
+            exec_command(["exfatlabel", partition_path, new_label])
+        else:
+            relabel_exfat_native(partition_path, new_label)
     elif norm_fs in ("fat", "fat16", "fat32", "vfat", "msdos"):
-        tool = "fatlabel"
+        if dry_run:
+            say(theme.muted(f"[DRY-RUN] Would relabel FAT32 partition {partition_path} to '{new_label}'"))
+            return
+        unmount_partition(partition_path, dry_run=dry_run)
+        if have_tool("fatlabel"):
+            exec_command(["fatlabel", partition_path, new_label])
+        else:
+            relabel_fat32_native(partition_path, new_label)
     else:
         raise ValueError(f"Relabeling is not supported for filesystem type: {fstype}")
 
-    if not have_tool(tool):
-        pkg = "e2fsprogs" if tool == "e2label" else ("exfatprogs" if tool == "exfatlabel" else "dosfstools")
-        raise RuntimeError(f"Relabel tool '{tool}' is missing. Install with: {get_package_installer(pkg)}")
-
-    cmd = [tool, partition_path, new_label]
-    if dry_run:
-        say(theme.muted(f"[DRY-RUN] Would run: {' '.join(cmd)}"))
-        return
-
-    unmount_partition(partition_path, dry_run=dry_run)
-    rc, _, err = exec_command(cmd)
-    if rc != 0:
-        raise RuntimeError(f"Relabeling failed ({tool}): {err}")
-    exec_command(["udevadm", "settle"])
+    if not dry_run:
+        exec_command(["udevadm", "settle"])
 
 
 def mount_partition_for_user(
